@@ -2,11 +2,14 @@ from detrex.config import get_config
 from ..models.dino_vitdet import model
 
 # get default config
-dataloader = get_config("common/data/coco_detr.py").dataloader
+dataloader = get_config("common/data/waymo_coco_detr_512.py").dataloader
 optimizer = get_config("common/optim.py").AdamW
 lr_multiplier = get_config("common/coco_schedule.py").lr_multiplier_12ep
 train = get_config("common/train.py").train
 
+# adjust ViTDet backbone to match 512x512 inputs
+model.backbone.net.img_size = 512
+model.backbone.square_pad = 512
 
 # modify training config
 train.init_checkpoint = "detectron2://ImageNetPretrained/MAE/mae_pretrain_vit_base.pth"
@@ -18,8 +21,8 @@ train.max_iter = 90000
 # run evaluation every 5000 iters
 train.eval_period = 5000
 
-# log training infomation every 20 iters
-train.log_period = 20
+# log training infomation every 10 iters
+train.log_period = 10
 
 # save checkpoint every 5000 iters
 train.checkpointer.period = 5000
@@ -46,6 +49,7 @@ dataloader.train.num_workers = 16
 # surpose you're using 4 gpus for training and the batch size for
 # each gpu is 16/4 = 4
 dataloader.train.total_batch_size = 16
+
 
 # dump the testing results into output_dir for visualization
 dataloader.evaluator.output_dir = train.output_dir

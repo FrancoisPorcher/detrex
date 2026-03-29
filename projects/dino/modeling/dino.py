@@ -76,8 +76,19 @@ class DINO(nn.Module):
         box_noise_scale: float = 1.0,
         input_format: Optional[str] = "RGB",
         vis_period: int = 0,
+        use_dinov3_backbone = False,
+        model_name = None,
+        img_size = None,
     ):
         super().__init__()
+        self.use_dinov3_backbone = use_dinov3_backbone
+        if self.use_dinov3_backbone:
+            assert img_size is not None, "img_size must be specified when using DINOv3Backbone"
+            assert model_name is not None, "model_name must be specified when using DINOv3Backbone"
+
+        self.model_name = model_name
+        print("using img size:", img_size)
+        self.img_size = img_size
         # define backbone and position embedding module
         self.backbone = backbone
         self.position_embedding = position_embedding
@@ -111,7 +122,15 @@ class DINO(nn.Module):
         self.device = device
         pixel_mean = torch.Tensor(pixel_mean).to(self.device).view(3, 1, 1)
         pixel_std = torch.Tensor(pixel_std).to(self.device).view(3, 1, 1)
-        self.normalizer = lambda x: (x - pixel_mean) / pixel_std
+        
+        if self.use_dinov3_backbone:
+            from transformers import AutoImageProcessor
+            self.processor = AutoImageProcessor.from_pretrained(
+                self.model_name, local_files_only=True
+            )
+            self.processor.size = {"height": self.img_size, "width": self.img_size}
+        else:
+            self.normalizer = lambda x: (x - pixel_mean) / pixel_std
 
         # initialize weights
         prior_prob = 0.01
@@ -147,8 +166,10 @@ class DINO(nn.Module):
         if vis_period > 0:
             assert input_format is not None, "input_format is required for visualization!"
 
+    def _backbone_patch_size(self):
+        return self.backbone.net._out_feature_strides[self.backbone.in_feature]
 
-    def forward(self, batched_inputs):
+    def forward(self, batched_inputs, inference_from_backbone=False):
         """Forward function of `DINO` which excepts a list of dict as inputs.
 
         Args:
@@ -173,7 +194,7 @@ class DINO(nn.Module):
                 - dict["aux_outputs"]: Optional, only returned when auxilary losses are activated. It is a list of
                             dictionnaries containing the two above keys for each decoder layer.
         """
-        images = self.preprocess_image(batched_inputs)
+        images = self.preprocess_image(batched_inputs, inference_from_backbone)
 
         if self.training:
             batch_size, _, H, W = images.tensor.shape
@@ -183,14 +204,18 @@ class DINO(nn.Module):
                 img_masks[img_id, :img_h, :img_w] = 0
         else:
             batch_size, _, H, W = images.tensor.shape
+            if inference_from_backbone:
+                patch_size = self._backbone_patch_size()
+                H *= patch_size
+                W *= patch_size
             img_masks = images.tensor.new_zeros(batch_size, H, W)
 
         # original features
-        features = self.backbone(images.tensor)  # output feature dict
+        features = self.backbone(images.tensor, inference_from_backbone)  # output feature dict
 
         # project backbone features to the reuired dimension of transformer
         # we use multi-scale features in DINO
-        multi_level_feats = self.neck(features)
+        multi_level_feats = self.neck(features) # list of features maps of length 4. Shapes [b, 256, 2*H, 2*W], [b, 256, H, W], [b, 256, H/2, W/2], [b, 256, H/4, W/4]
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
@@ -213,6 +238,7 @@ class DINO(nn.Module):
                 num_classes=self.num_classes,
                 hidden_dim=self.embed_dim,
                 label_enc=self.label_enc,
+                 
             )
         else:
             input_query_label, input_query_bbox, attn_mask, dn_meta = None, None, None, None
@@ -300,6 +326,7 @@ class DINO(nn.Module):
             for results_per_image, input_per_image, image_size in zip(
                 results, batched_inputs, images.image_sizes
             ):
+                # Important, height and width should be the original sizes, I think I destroyed them
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 r = detector_postprocess(results_per_image, height, width)
@@ -499,10 +526,25 @@ class DINO(nn.Module):
             dn_metas["output_known_lbs_bboxes"] = out
         return outputs_class, outputs_coord
 
-    def preprocess_image(self, batched_inputs):
-        images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
-        images = ImageList.from_tensors(images)
-        return images
+    def preprocess_image(self, batched_inputs, inference_from_backbone = False):
+        if inference_from_backbone:
+            images = [x["image"].to(self.device) for x in batched_inputs]
+        else:
+            if self.use_dinov3_backbone:
+                images = [x["image"] for x in batched_inputs]
+                bs = len(images)
+                images = self.processor(images=images, return_tensors="pt")
+                images = images["pixel_values"].to(self.device, non_blocking = True)
+                images = [images[i] for i in range(bs)]
+            else:
+                images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
+
+        images = ImageList.from_tensors(images) # images.tensor has shape [bs, 3, H, W]
+        # Scale up image_sizes when reading from backbone (feature maps are downsampled by patch size)
+        if inference_from_backbone:
+            patch_size = self._backbone_patch_size()
+            images.image_sizes = [(h * patch_size, w * patch_size) for h, w in images.image_sizes]
+        return images # Shape [bs,D, H, W] if inference_from_backbone else [bs,3, H, W]
 
     def inference(self, box_cls, box_pred, image_sizes):
         """

@@ -12,8 +12,8 @@ from .dino_vitdet_large_4scale_12ep import (
 
 # modify training config
 train.max_iter = 375000
-train.init_checkpoint = "detectron2://ImageNetPretrained/MAE/mae_pretrain_vit_large.pth"
-train.output_dir = "./output/dino_vitdet_large_50ep"
+train.init_checkpoint = ""
+train.output_dir = "./output/dino_vitdet_dinov3_large_50ep"
 
 # use warmup lr scheduler
 lr_multiplier = L(WarmupParamScheduler)(
